@@ -31,13 +31,6 @@ recycling_memory_resource::local() noexcept
     return p;
 }
 
-bool&
-recycling_memory_resource::thread_armed() noexcept
-{
-    static thread_local bool armed = false;
-    return armed;
-}
-
 #endif
 
 namespace {
@@ -63,13 +56,14 @@ recycling_memory_resource::arm_thread_cleanup() noexcept
                 while(b.count > 0)
                     ::operator delete(b.pop());
             pool_drained = true;
-            thread_armed() = false;
+            lp.limit = 0;
         }
     };
     if(pool_drained)
         return false;
     static thread_local janitor j;
     std::ignore = j;
+    local().limit = bucket_capacity;
     return true;
 }
 
@@ -111,25 +105,30 @@ recycling_memory_resource::global_mutex() noexcept
 }
 
 void*
-recycling_memory_resource::allocate_slow(
-    std::size_t rounded, std::size_t idx)
+recycling_memory_resource::allocate_slow(std::size_t idx)
 {
     // Once this thread's pool was drained at exit, take one block and
     // leave the pool empty: nothing would release a refill.
-    bool const cache = arm_thread_cleanup();
+    auto& lp = local();
+    bool const cache = lp.limit != 0 || arm_thread_cleanup();
     {
         std::lock_guard<std::mutex> lock(global_mutex());
         auto& b = global().buckets[idx];
-        if(auto* p = cache ? b.pop(local().buckets[idx]) : b.pop())
+        if(auto* p = cache ? b.pop(lp.buckets[idx]) : b.pop())
             return p;
     }
-    return ::operator new(rounded);
+    return ::operator new(class_size(idx));
 }
 
 void
 recycling_memory_resource::deallocate_slow(
     void* p, std::size_t idx)
 {
+    // First free on a thread whose pool is not yet armed: arm it and
+    // cache locally. A drained pool stays closed (limit 0).
+    auto& lp = local();
+    if(lp.limit == 0 && arm_thread_cleanup() && lp.buckets[idx].push(p))
+        return;
     {
         std::lock_guard<std::mutex> lock(global_mutex());
         if(global().buckets[idx].push(p))
@@ -150,12 +149,11 @@ recycling_memory_resource::do_deallocate(void* p, std::size_t bytes, std::size_t
     deallocate_fast(p, bytes, alignment);
 }
 
-std::pmr::memory_resource*
-get_recycling_memory_resource() noexcept
-{
-    static recycling_memory_resource instance;
-    return &instance;
-}
+namespace detail {
+
+constinit recycling_storage recycling_instance;
+
+} // namespace detail
 
 } // namespace capy
 } // namespace boost

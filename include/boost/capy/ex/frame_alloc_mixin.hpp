@@ -19,8 +19,41 @@
 #include <cstring>
 #include <memory_resource>
 
+// The recycling fast path is forced inline into each coroutine's ramp and
+// destroy functions, where the frame size is a constant, so the size class
+// folds away. Not on MSVC, which may keep an inlined thread_local's address
+// in a coroutine frame across a suspension (see current_frame_allocator_ref).
+#if BOOST_CAPY_WORKAROUND(BOOST_CAPY_MSVC, >= 1)
+# define BOOST_CAPY_FRAME_INLINE inline
+#else
+# define BOOST_CAPY_FRAME_INLINE BOOST_CAPY_FORCEINLINE
+#endif
+
 namespace boost {
 namespace capy {
+
+namespace detail {
+
+// Frames from any resource other than the recycling one, out of line so
+// the inlined recycling path stays small. A null resource means "not set".
+BOOST_CAPY_NOINLINE inline void*
+allocate_frame_other(std::pmr::memory_resource* mr, std::size_t size)
+{
+    if(!mr)
+        mr = std::pmr::get_default_resource();
+    void* raw = mr->allocate(size + sizeof(mr), frame_alignment);
+    std::memcpy(static_cast<char*>(raw) + size, &mr, sizeof(mr));
+    return raw;
+}
+
+BOOST_CAPY_NOINLINE inline void
+deallocate_frame_other(
+    std::pmr::memory_resource* mr, void* ptr, std::size_t size) noexcept
+{
+    mr->deallocate(ptr, size + sizeof(mr), frame_alignment);
+}
+
+} // namespace detail
 
 /** Mixin that adds frame-allocator-aware allocation to a promise type.
 
@@ -71,21 +104,16 @@ struct frame_alloc_mixin
         resource's `allocate`, for example `std::bad_alloc` from
         `::operator new`.
     */
-    static void* operator new(std::size_t size)
+    BOOST_CAPY_FRAME_INLINE static void* operator new(std::size_t size)
     {
-        static auto* const rmr = get_recycling_memory_resource();
+        auto* const rmr = &detail::recycling_instance.mr;
 
-        auto* mr = get_current_frame_allocator();
-        if(!mr)
-            mr = std::pmr::get_default_resource();
+        std::pmr::memory_resource* mr = get_current_frame_allocator();
+        if(mr != rmr) [[unlikely]]
+            return detail::allocate_frame_other(mr, size);
 
-        auto total = size + sizeof(std::pmr::memory_resource*);
-        void* raw;
-        if(mr == rmr)
-            raw = static_cast<recycling_memory_resource*>(mr)
-                ->allocate_fast(total, detail::frame_alignment);
-        else
-            raw = mr->allocate(total, detail::frame_alignment);
+        void* raw = rmr->allocate_fast(
+            size + sizeof(mr), detail::frame_alignment);
         std::memcpy(static_cast<char*>(raw) + size, &mr, sizeof(mr));
         return raw;
     }
@@ -102,18 +130,20 @@ struct frame_alloc_mixin
         The allocator pointer is read from `ptr + size`, which is where
         `operator new` wrote it, so this value must match.
     */
-    static void operator delete(void* ptr, std::size_t size) noexcept
+    BOOST_CAPY_FRAME_INLINE static void
+    operator delete(void* ptr, std::size_t size) noexcept
     {
-        static auto* const rmr = get_recycling_memory_resource();
+        auto* const rmr = &detail::recycling_instance.mr;
 
         std::pmr::memory_resource* mr;
         std::memcpy(&mr, static_cast<char*>(ptr) + size, sizeof(mr));
-        auto total = size + sizeof(std::pmr::memory_resource*);
-        if(mr == rmr)
-            static_cast<recycling_memory_resource*>(mr)
-                ->deallocate_fast(ptr, total, detail::frame_alignment);
-        else
-            mr->deallocate(ptr, total, detail::frame_alignment);
+        if(mr != rmr) [[unlikely]]
+        {
+            detail::deallocate_frame_other(mr, ptr, size);
+            return;
+        }
+        rmr->deallocate_fast(
+            ptr, size + sizeof(mr), detail::frame_alignment);
     }
 };
 
@@ -124,18 +154,15 @@ namespace detail {
 // afterwards never reaches a resource that died with that chain.
 struct process_frame_mixin
 {
-    static void* operator new(std::size_t size)
+    BOOST_CAPY_FRAME_INLINE static void* operator new(std::size_t size)
     {
-        return static_cast<recycling_memory_resource*>(
-            get_recycling_memory_resource())
-                ->allocate_fast(size, detail::frame_alignment);
+        return recycling_instance.mr.allocate_fast(size, frame_alignment);
     }
 
-    static void operator delete(void* ptr, std::size_t size) noexcept
+    BOOST_CAPY_FRAME_INLINE static void
+    operator delete(void* ptr, std::size_t size) noexcept
     {
-        static_cast<recycling_memory_resource*>(
-            get_recycling_memory_resource())
-                ->deallocate_fast(ptr, size, detail::frame_alignment);
+        recycling_instance.mr.deallocate_fast(ptr, size, frame_alignment);
     }
 };
 

@@ -54,17 +54,20 @@ class BOOST_CAPY_DECL recycling_memory_resource : public std::pmr::memory_resour
     static constexpr std::size_t max_class_size = 2048; // 2^11
     static constexpr std::size_t bucket_capacity = 16;
 
+    // Size class of an n-byte request: 0 for up to 64 bytes, 1 for up
+    // to 128, ..., 5 for up to 2048, and num_classes or more beyond (n
+    // == 0 too, on allocate and deallocate alike). Four operations.
     static std::size_t
-    round_up_pow2(std::size_t n) noexcept
+    class_index(std::size_t n) noexcept
     {
-        return n <= min_class_size ? min_class_size : std::bit_ceil(n);
+        return static_cast<std::size_t>(
+            std::bit_width((n - 1) | (min_class_size - 1))) - 6;
     }
 
     static std::size_t
-    get_class_index(std::size_t rounded) noexcept
+    class_size(std::size_t idx) noexcept
     {
-        std::size_t idx = std::countr_zero(rounded) - 6;  // 64 = 2^6
-        return idx < num_classes ? idx : num_classes;
+        return min_class_size << idx;
     }
 
     struct bucket
@@ -102,6 +105,11 @@ class BOOST_CAPY_DECL recycling_memory_resource : public std::pmr::memory_resour
 
     struct pool
     {
+        // Blocks a bucket may cache: 0 until this thread arms its exit
+        // drain, bucket_capacity once armed, and 0 again after the drain
+        // ran. A free that finds its bucket at the limit takes the slow
+        // path, which arms, so the hot path needs no separate flag.
+        std::size_t limit = 0;
         bucket buckets[num_classes];
 
         // No destructor: a non-trivial dtor forces a guard variable on the
@@ -114,7 +122,7 @@ class BOOST_CAPY_DECL recycling_memory_resource : public std::pmr::memory_resour
 
 #if (defined(BOOST_CAPY_DYN_LINK) || defined(BOOST_ALL_DYN_LINK)) && \
     !defined(BOOST_CAPY_STATIC_LINK)
-    // A shared build defines this thread's pool, and the flag below, in
+    // A shared build defines this thread's pool in
     // the library: inline, each module would cache in a pool of its own,
     // which the library's thread-exit cleanup never drains.
     static pool& local() noexcept;
@@ -129,28 +137,15 @@ class BOOST_CAPY_DECL recycling_memory_resource : public std::pmr::memory_resour
     static pool& global() noexcept;
     static std::mutex& global_mutex() noexcept;
 
-    void* allocate_slow(std::size_t rounded, std::size_t idx);
+    void* allocate_slow(std::size_t idx);
     void deallocate_slow(void* p, std::size_t idx);
 
     // Register a thread-exit callback that drains this thread's local
-    // pool back to the OS. Called only off the hot path: unconditionally
-    // from the slow paths, and from deallocate_fast while the flag below
-    // is clear. Returns false once that callback has run: nothing drains
-    // the local pool after it, so frees must bypass it.
+    // pool back to the OS, and open the pool (limit = bucket_capacity).
+    // Called only from the slow paths, while the limit is 0. Returns
+    // false once that callback has run: nothing drains the local pool
+    // after it, so frees must bypass it.
     static bool arm_thread_cleanup() noexcept;
-
-    // Guard-free flag (constinit bool, trivial dtor): set once cleanup is
-    // armed, and cleared again when the cleanup has run.
-#if (defined(BOOST_CAPY_DYN_LINK) || defined(BOOST_ALL_DYN_LINK)) && \
-    !defined(BOOST_CAPY_STATIC_LINK)
-    static bool& thread_armed() noexcept;
-#else
-    static bool& thread_armed() noexcept
-    {
-        static thread_local bool armed = false;
-        return armed;
-    }
-#endif
 
 public:
     /** Destroy the resource.
@@ -185,14 +180,13 @@ public:
     void*
     allocate_fast(std::size_t bytes, std::size_t)
     {
-        std::size_t rounded = round_up_pow2(bytes);
-        std::size_t idx = get_class_index(rounded);
+        std::size_t idx = class_index(bytes);
         if(idx >= num_classes)
             return ::operator new(bytes);
-        auto& lp = local();
-        if(auto* p = lp.buckets[idx].pop())
-            return p;
-        return allocate_slow(rounded, idx);
+        auto& b = local().buckets[idx];
+        if(b.count != 0)
+            return b.ptrs[--b.count];
+        return allocate_slow(idx);
     }
 
     /** Deallocate without virtual dispatch.
@@ -217,29 +211,23 @@ public:
     void
     deallocate_fast(void* p, std::size_t bytes, std::size_t)
     {
-        std::size_t rounded = round_up_pow2(bytes);
-        std::size_t idx = get_class_index(rounded);
+        std::size_t idx = class_index(bytes);
         if(idx >= num_classes)
         {
             ::operator delete(p);
             return;
         }
-        // Arms thread-exit cleanup for any thread that caches via
-        // deallocate, including consumer threads that never hit a slow
-        // path; after that cleanup, the block bypasses the local pool.
-        auto& armed = thread_armed();
-        if(!armed)
-        {
-            if(!arm_thread_cleanup())
-            {
-                deallocate_slow(p, idx);
-                return;
-            }
-            armed = true;
-        }
+        // A pool not yet armed has limit 0, so its first free takes the
+        // slow path, which arms thread-exit cleanup (including consumer
+        // threads that never allocate); after that cleanup the limit is
+        // 0 again and the block bypasses the local pool.
         auto& lp = local();
-        if(lp.buckets[idx].push(p))
+        auto& b = lp.buckets[idx];
+        if(b.count < lp.limit)
+        {
+            b.ptrs[b.count++] = p;
             return;
+        }
         deallocate_slow(p, idx);
     }
 
@@ -294,6 +282,25 @@ protected:
 };
 BOOST_CAPY_MSVC_WARNING_POP
 
+namespace detail {
+
+// Storage for the process-wide instance. Constant-initialized and never
+// destroyed: its address is a link-time constant, so comparing against it
+// needs no static-init guard, and it outlives every static that frees a
+// frame. The resource is stateless, so skipping its destructor leaks
+// nothing.
+union recycling_storage
+{
+    recycling_memory_resource mr;
+
+    constexpr recycling_storage() noexcept : mr() {}
+    ~recycling_storage() {}
+};
+
+BOOST_CAPY_DECL extern recycling_storage recycling_instance;
+
+} // namespace detail
+
 /** Returns pointer to the default recycling memory resource.
 
     The returned pointer is valid for the lifetime of the program.
@@ -304,9 +311,12 @@ BOOST_CAPY_MSVC_WARNING_POP
     @see @ref recycling_memory_resource
     @see @ref run_async
 */
-BOOST_CAPY_DECL
+inline
 std::pmr::memory_resource*
-get_recycling_memory_resource() noexcept;
+get_recycling_memory_resource() noexcept
+{
+    return &detail::recycling_instance.mr;
+}
 
 } // namespace capy
 } // namespace boost

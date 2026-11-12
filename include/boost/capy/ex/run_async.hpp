@@ -286,7 +286,10 @@ struct run_async_trampoline<Ex, Handlers, std::pmr::memory_resource*>
             std::pmr::memory_resource* mr)
         {
             auto total = size + sizeof(mr);
-            void* raw = mr->allocate(total, frame_alignment);
+            auto* const rmr = &recycling_instance.mr;
+            void* raw = mr == rmr
+                ? rmr->allocate_fast(total, frame_alignment)
+                : mr->allocate(total, frame_alignment);
             std::memcpy(static_cast<char*>(raw) + size, &mr, sizeof(mr));
             return raw;
         }
@@ -296,7 +299,11 @@ struct run_async_trampoline<Ex, Handlers, std::pmr::memory_resource*>
             std::pmr::memory_resource* mr;
             std::memcpy(&mr, static_cast<char*>(ptr) + size, sizeof(mr));
             auto total = size + sizeof(mr);
-            mr->deallocate(ptr, total, frame_alignment);
+            auto* const rmr = &recycling_instance.mr;
+            if(mr == rmr)
+                rmr->deallocate_fast(ptr, total, frame_alignment);
+            else
+                mr->deallocate(ptr, total, frame_alignment);
         }
 
         std::pmr::memory_resource* get_resource() noexcept
